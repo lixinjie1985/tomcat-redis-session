@@ -1,8 +1,12 @@
 Overview
-一个session管理器的实现，把session存储在redis里面，这样请求就可以横穿tomcat集群，session一旦创建就立即存入redis，当请求时session直接从redis里面加载，对于同一个request后续再请求session时将从ThreadLocal缓存中取出而不是多次访问redis，为了尽可能地防止冲突和丢失写入操作，当session修改时，session数据只在redis里面更新。管理器依赖于redis本身的超时能力来使keys超时来实现session的自动超时，这样可以避免自己经常搜索整个session列表来使它们超时带来的开销。存储在session里面的数据必须是可序列化的
+一个session管理器的实现，把session存储在redis里面，这样请求就可以横穿tomcat集群，session一旦创建就立即存入redis，当请求时session直接从redis里面加载，
+对于同一个request后续再请求session时将从ThreadLocal缓存中取出而不是多次访问redis，为了尽可能地防止冲突和丢失写入操作，当session修改时，
+session数据只在redis里面更新。管理器依赖于redis本身的超时能力来使keys超时来实现session的自动超时，
+这样可以避免自己经常搜索整个session列表来使它们超时带来的开销。存储在session里面的数据必须是可序列化的
 
 Architecture
-RedisSessionManager：提供session的创建，保存，加载功能。RedisSessionHandlerValve：在一个请求被处理完后确保session被保存好了。tomcat自己的session实现是有粘性的，来自同一个session的请求必须路由到同一个server，而这里的实现将是不确定性的，因为主要目的是为了故障转移
+RedisSessionManager：提供session的创建，保存，加载功能。RedisSessionHandlerValve：在一个请求被处理完后确保session被保存好了。
+tomcat自己的session实现是有粘性的，来自同一个session的请求必须路由到同一个server，而这里的实现将是不确定性的，因为主要目的是为了故障转移
 
 Usage
 https://github.com/jcoleman/tomcat-redis-session-manager/downloads下载相关jar包
@@ -28,13 +32,26 @@ Copy the following files into the TOMCAT_BASE/lib directory:
 Reboot the server, and sessions should now be stored in Redis.
 
 Connection Pool Configuration
-来自于org.apache.commons.pool2.impl.GenericObjectPoolConfig和org.apache.commons.pool2.impl.BaseObjectPoolConfig的相关配置选项，对于redis的连接池来说也是可以使用的，把相关属性前面加上connectionPool前缀即可，例如maxIdle和testOnBorrow，将变成connectionPoolMaxIdle和connectionPoolTestOnBorrow，并把它们配置在<Manager>元素中。Session管理器内部使用redis连接池访问redis
+来自于org.apache.commons.pool2.impl.GenericObjectPoolConfig和org.apache.commons.pool2.impl.BaseObjectPoolConfig的相关配置选项，
+对于redis的连接池来说也是可以使用的，把相关属性前面加上connectionPool前缀即可，例如maxIdle和testOnBorrow，
+将变成connectionPoolMaxIdle和connectionPoolTestOnBorrow，并把它们配置在<Manager>元素中。Session管理器内部使用redis连接池访问redis
 
 Session Change Tracking
-为了防止冲突写操作，当session对象改变时，管理器就把它序列化到redis里面（对超时时间的更新总是分开进行的），当需要序列化时会被脏跟踪标记，对session.removeAttribute(key)的调用总是被标记为脏的，对session.setAttribute(key, newAttributeValue)的调用当新值与旧值不同时会被标记为脏的，分为四种情况，previousAttributeValue == null && newAttributeValue != null，previousAttributeValue != null && newAttributeValue == null，!newAttributeValue.getClass().isInstance(previousAttributeValue)，!newAttributeValue.equals(previousAttributeValue)。不过当属性值为容器时，以上规则存在缺陷，在容器中添加删除元素，session并不会被标记为脏的，为了解决这个问题，就是在session里再设置一个指定的key来使它变脏，例如session.setAttribute("__changed__")，由于一些应用里可能已经使用了这个__changed__键，所以这个解决方案默认是禁用的，为了启用这个特性，只需在你的应用初始化时调用RedisSession.setManualDirtyTrackingSupportEnabled(true)，如果想换一个key也可以，需要调用RedisSession.setManualDirtyTrackingAttributeKey("customDirtyFlag")
+为了防止冲突写操作，当session对象改变时，管理器就把它序列化到redis里面（对超时时间的更新总是分开进行的），当需要序列化时会被脏跟踪标记，
+对session.removeAttribute(key)的调用总是被标记为脏的，对session.setAttribute(key, newAttributeValue)的调用当新值与旧值不同时会被标记为脏的，
+分为四种情况，previousAttributeValue == null && newAttributeValue != null，previousAttributeValue != null && newAttributeValue == null，
+!newAttributeValue.getClass().isInstance(previousAttributeValue)，!newAttributeValue.equals(previousAttributeValue)。不过当属性值为容器时，
+以上规则存在缺陷，在容器中添加删除元素，session并不会被标记为脏的，为了解决这个问题，就是在session里再设置一个指定的key来使它变脏，
+例如session.setAttribute("__changed__")，由于一些应用里可能已经使用了这个__changed__键，所以这个解决方案默认是禁用的，为了启用这个特性，
+只需在你的应用初始化时调用RedisSession.setManualDirtyTrackingSupportEnabled(true)，如果想换一个key也可以，
+需要调用RedisSession.setManualDirtyTrackingAttributeKey("customDirtyFlag")
 
 Persistence Policies
-对于一个持久化存储的session，将会有一个不同可能性的竞争条件，当多个请求交叉或并发地访问同一个session，由于session是整个对象进行序列化的，当存在并发时最后一个胜出，可能会覆盖前面对其它key值已经做出的修改，因此可以使用sessionPersistPolicies（tomcat的context.xml文件中）配置持久化策略。有两种策略，SAVE_ON_CHANGE：每次session有更改时就序列化，注意，无法知道是否有其他人对session里已存在的其它属性值对象做了修改，权衡，将轻微降低性能，因为每次更改都序列化。ALWAYS_SAVE_AFTER_REQUEST：每次请求后都序列化而不管session是否有更改，非常适用于对已存在属性值对象的修改，权衡，这种情况貌似实际增加了竞争条件，如果不是所有的请求都修改session
+对于一个持久化存储的session，将会有一个不同可能性的竞争条件，当多个请求交叉或并发地访问同一个session，由于session是整个对象进行序列化的，
+当存在并发时最后一个胜出，可能会覆盖前面对其它key值已经做出的修改，因此可以使用sessionPersistPolicies（tomcat的context.xml文件中）配置持久化策略。
+有两种策略，SAVE_ON_CHANGE：每次session有更改时就序列化，注意，无法知道是否有其他人对session里已存在的其它属性值对象做了修改，权衡，将轻微降低性能，
+因为每次更改都序列化。ALWAYS_SAVE_AFTER_REQUEST：每次请求后都序列化而不管session是否有更改，非常适用于对已存在属性值对象的修改，权衡，
+这种情况貌似实际增加了竞争条件，如果不是所有的请求都修改session
 
 
 
